@@ -38,31 +38,30 @@ Follow the instructions within the [Installation section](../1-Installation/READ
 you should have an ODH installation, a TrustyAI Operator, and a `model-namespace` project containing
 an instance of the TrustyAI Service.
 
-Since models deployed via KServe are currently authenticated by leveraging [Authorino](https://github.com/Kuadrant/authorino), it is necessary to install the Authorino Operator and configure it accordingly; refer to this [blog post](https://developers.redhat.com/articles/2024/07/22/protecting-your-models-made-easy-authorino) on how to set up Authorino on Open Data Hub.
 > ✏️ TrustyAI endpoints are authenticated via a Bearer token. To obtain this token, run the following commands:
 > ```shell
-> oc apply -f resources/service_account.yaml
 > export TOKEN=$(oc create token user-one)   
 > ```
 >
 
-## Configure TLS 
-Follow the [Update KServe ConfigMap](https://github.com/trustyai-explainability/reference/tree/main/trustyai-service/kserve-raw/metrics#update-kserve-config-map) and [Prepare TLS](https://github.com/trustyai-explainability/reference/tree/main/trustyai-service/kserve-raw/metrics#prepare-tls) sections here. Note: if you're using Red Hat Openshift AI, all commands that use `-n opendatahub` should be replaced with `-n redhat-ods-applications`
-
-
 ## Deploy Models
-1) Navigate to the `model-namespace` created in the setup section: `oc project model-namespace`
-2) Deploy the model's storage container: `oc apply -f resources/model_storage_container.yaml`
-3) Deploy the OVMS 1.x serving runtime: `oc apply -f resources/ovms-1.x.yaml`
-4) Deploy the first model: `oc apply -f resources/model_alpha.yaml`
-5) Deploy the second model: `oc apply -f resources/model_beta.yaml`
-6) From the OpenShift Console, navigate to the `model-namespace` project and look at the Workloads -> Pods screen.
+```shell
+oc project model-namespace || true
+oc apply -f resources/model_storage_container.yaml; oc wait --for=condition=ready pod -l app=minio
+oc apply -f resources/models.yaml
+```
 
-To sense-check that the namespace contains the expected resources, navigate to the OpenShift Console and look at the Workloads -> Pods screen. You should see the following [pods](images/model_namespace_pods.png):
+The TrustyAI service will react to the model deployment and inject a container into it. This will cause the original model deployments to be deleted, and a new
+set of 4-container deployments to be created. 
 
-- one pod for the model storage container `minio`
-- four pods for each of the deployed models
-- two pods for the TrustyAI Service
+4) From the OpenShift Console, navigate to the `model-namespace` project and look at the Workloads -> Pods screen. After the model deployment has settled, you should see the following pods:
+- The model storage container, with 1 container
+- The two deployed models, each with 4 containers
+- The TrustyAI Service, with 2 containers
+
+![pods](images/model_namespace_pods.png)
+
+It can sometimes take a minute or two for all the resources to deconflict, e.g., you might see the new 4-container model deployments co-existing with the old 3-container deployments. Give it a minute or two, the old 3-container will eventually be deleted.
 
 ## Send Training Data to Models
 Here, we'll pass all the training data through the models, such as to be able to compute baseline fairness values:
@@ -76,16 +75,18 @@ done
 This will take a few minutes. The script will print out verification messages indicating whether TrustyAI is receiving the data, but we can also verify in the Cluster Metrics:
 1) Navigate to Observe -> Metrics in the OpenShift console.
 2) Set the time window to 5 minutes (top left) and the refresh interval to 15 seconds (top right)
-3) In the "Expression" field, enter `trustyai_model_observations_total` and hit "Run Queries". You should see both models listed, each reporting around 2250 observed inferences: ![Checking observed inferences](images/observed_inferences.png). This means that TrustyAI has catalogued 2250 inputs and outputs for each of the two models, more than enough to begin analysis.
+3) In the "Expression" field, enter `trustyai_model_observations_total` and hit "Run Queries". You should see both models listed, and once the data upload script has finished, each model should report around 2250 observed inferences: ![Checking observed inferences](images/observed_inferences.png)
+This means that TrustyAI has catalogued 2250 inputs and outputs for each of the two models, more than enough to begin analysis.
 
 ## Examining TrustyAI's Model Metadata
 We can also verify that TrustyAI sees the models via the `/info` endpoint:
-1) Find the route to the TrustyAI Service: `TRUSTY_ROUTE=https://$(oc get route/trustyai-service --template={{.spec.host}})`
-2) Query the `/info` endpoints for each model:
-   - `curl -H "Authorization: Bearer ${TOKEN}" $TRUSTY_ROUTE/info | jq '.["demo-loan-nn-onnx-alpha"].data.inputSchema'`
-   - `curl -H "Authorization: Bearer ${TOKEN}" $TRUSTY_ROUTE/info | jq '.["demo-loan-nn-onnx-beta"].data.inputSchema'`
+```shell
+TRUSTY_ROUTE=https://$(oc get route/trustyai-service --template={{.spec.host}})
+curl -H "Authorization: Bearer ${TOKEN}" $TRUSTY_ROUTE/info | jq '.["demo-loan-nn-onnx-alpha"].data | {inputSchema: .inputSchema, outputSchema: .outputSchema}'
+curl -H "Authorization: Bearer ${TOKEN}" $TRUSTY_ROUTE/info | jq '.["demo-loan-nn-onnx-beta"].data | {inputSchema: .inputSchema, outputSchema: .outputSchema}'
+````
 
-This will output a json file ([sample provided here](resources/info_response.json)) containing the following information for each model:
+Each curl command will output a json file ([sample provided here](resources/info_response.json)) containing the following information for each model:
    1) The names, data types, and positions of fields in the input and output
    2) The total number of input-output pairs observed
 
@@ -95,6 +96,32 @@ As you can see, our models have not provided particularly useful field names for
 `./scripts/apply_name_mapping.sh`
 
 Explore the [apply_name_mapping.sh](scripts/apply_name_mapping.sh) script to understand how the payload is structured.
+
+After running the name mapping script, you can verify that the name mapping was successfully applied by requerying the `/info` endpoint:
+
+```shell
+curl -H "Authorization: Bearer ${TOKEN}" $TRUSTY_ROUTE/info | jq '.["demo-loan-nn-onnx-alpha"].data | {inputSchema: .inputSchema, outputSchema: .outputSchema}'
+curl -H "Authorization: Bearer ${TOKEN}" $TRUSTY_ROUTE/info | jq '.["demo-loan-nn-onnx-beta"].data | {inputSchema: .inputSchema, outputSchema: .outputSchema}'
+```
+Notice we now have a populated `nameMapping`:
+
+```json
+    "nameMapping": {
+      "customer_data_input-0": "Number of Children",
+      "customer_data_input-1": "Total Income",
+      "customer_data_input-2": "Number of Total Family Members",
+      "customer_data_input-3": "Is Male-Identifying?",
+      "customer_data_input-4": "Owns Car?",
+      "customer_data_input-5": "Owns Realty?",
+      "customer_data_input-6": "Is Partnered?",
+      "customer_data_input-7": "Is Employed?",
+      "customer_data_input-8": "Live with Parents?",
+      "customer_data_input-9": "Age",
+      "customer_data_input-10": "Length of Employment?"
+    }
+```
+
+
 
 ## Check Model Fairness
 To compute the model's cumulative fairness up to this point, we can check the `/metrics/group/fairness/spd` endpoint:
@@ -255,3 +282,14 @@ Meanwhile, looking at the will-default to will-not-default ratio:
 We can see that despite seeing only non-male applicants, Model Alpha (green) still provided varying outcomes to the various applicants, predicting "will-default" around 25% of the time. Model Beta (purple) predicted "will-default" 100% of the time: every single applicant was predicted to default on their loan. Again, this is a clear indicator that our model is performing poorly on the real-world data and/or has encoded a systematic bias from its training; it is predicting that every single non-male applicant will default.
 
 These examples show exactly why monitoring bias in production is so important: models that are equally fair at training time may perform _drastically_ differently over real-world data, with hidden biases only manifesting over real-world data. This means these biases are exposed to the public, being imposed upon whoever is subject to your models decisions, and therefore using TrustyAI to provide early warning of these biases can protect you from the damages that problematic models in production can do.
+
+## Cleanup
+To clean up this demo, run:
+```shell
+oc delete -f resources/models.yaml
+oc delete -f resources/model_storage_container.yaml
+TRUSTY_POD=$(oc get pods -o name | grep trustyai)
+oc exec $TRUSTY_POD -- bash -c "rm -f /inputs/*.csv /inputs/*.json"
+oc delete $TRUSTY_POD
+```
+This will uninstall your models, delete all recorded model data from the TrustyAI service, and delete any metric computations you may have set up.
