@@ -38,34 +38,23 @@ Follow the instructions within the [Installation section](../1-Installation/READ
 you should have an ODH installation, a TrustyAI Operator, and a `model-namespace` project containing
 an instance of the TrustyAI Service.
 
-Since models deployed via KServe are currently authenticated by leveraging [Authorino](https://github.com/Kuadrant/authorino), it is necessary to install the Authorino Operator and configure it accordingly; refer to this [blog post](https://developers.redhat.com/articles/2024/07/22/protecting-your-models-made-easy-authorino) on how to set up Authorino on Open Data Hub.
 > ✏️ TrustyAI endpoints are authenticated via a Bearer token. To obtain this token, run the following commands:
 > ```shell
-> oc apply -f resources/service_account.yaml
 > export TOKEN=$(oc create token user-one)   
 > ```
 
-## Configure TLS 
-Follow the [Update KServe ConfigMap](https://github.com/trustyai-explainability/reference/tree/main/trustyai-service/kserve-raw/metrics#update-kserve-config-map) and [Prepare TLS](https://github.com/trustyai-explainability/reference/tree/main/trustyai-service/kserve-raw/metrics#prepare-tls) sections here. Note: if you're using Red Hat Openshift AI, all commands that use `-n opendatahub` should be replaced with `-n redhat-ods-applications`
-
-
 ## Deploy Model
-1) Navigate to the `model-namespace` created in the setup section
-2) Deploy the model's storage container
-3) Deploy the Seldon MLServer serving runtime
-4) Deploy the credit model
-6) From the OpenShift Console, navigate to the `model-namespace` project and look at the Workloads -> Pods screen. You should see the following pods within ythe previously created [namespace](images/namespace_pods.png)
-    - one pod for the model storage container `minio`
-    - four pods for the `gaussian-credit-model`
-    - two pods for the TrustyAI Service
-
-The command to do all of the above is:
-```bash
+```shell
 oc project model-namespace || true
-oc apply -f resources/model_storage_container.yaml
-oc apply -f resources/odh-mlserver-1.x.yaml
+oc apply -f resources/model_storage_container.yaml; oc wait --for=condition=ready pod -l app=minio
 oc apply -f resources/model_gaussian_credit.yaml
 ```
+
+Similarly to the bias tutorial, make sure that you've got a model pod with 4/4 containers ready before continuing. The following command
+will continuously check for your model's readiness and will finish when the pod is ready to use:
+```shell
+oc wait --for=condition=Available deployment/gaussian-credit-model-predictor-00002-deployment --timeout=600s
+````
 
 ## Upload Model Training Data To TrustyAI
 First, we'll get the route to the TrustyAI service in our project:
@@ -118,7 +107,10 @@ features of our model.
 
 ## Examining TrustyAI's Model Metadata
 We can verify that TrustyAI has received the data via `/info` endpoint:
-2) Query the `/info` endpoint: `curl -H "Authorization: Bearer ${TOKEN}" $TRUSTY_ROUTE/info | jq '.["gaussian-credit-model"].data.inputSchema'`. This will output a json file  containing the following information:
+```shell
+curl -H "Authorization: Bearer ${TOKEN}" $TRUSTY_ROUTE/info | jq '.["gaussian-credit-model"].data.inputSchema'
+```
+This will output a json file  containing the following information:
 
 ```json
 {
@@ -166,26 +158,18 @@ curl -k -H "Authorization: Bearer ${TOKEN}" -X POST --location $TRUSTY_ROUTE/met
 
 The body of the payload is quite simple, requiring a `modelId` to set the model to monitor and a `referenceTag` that
 determines which data to use as the reference distribution, in our case `TRAINING` to match the tag we used when we uploaded the training
-data. This will then measure the drift of all recorded inference data against
-the reference distribution.
+data. This will then measure the drift of all recorded inference data against the reference distribution.
 
-## Check the Metrics
-1) Navigate to Observe -> Metrics in the OpenShift console. If you're already on that page, you may need to refresh before the new metrics appear in the suggested expressions.
-2) Set the time window to 5 minutes (top left) and the refresh interval to 15 seconds (top right)
-3) In the "Expression" field, enter `trustyai_meanshift`. It might take a few seconds before the cluster monitoring stacks picks up the new metric, so if `trustyai_meanshift` is not appearing, try refreshing the page.
-4) Explore the Metric Chart:
-![Initial Meanshift Chart](images/meanshift_initial.png)
-5) You'll notice that a metric is emitted for each of the four features and the single output, making for five measurements in total. All metric values should equal 1 (no drift), which makes sense: we _only_ have the training data, which can't drift from itself. 
+> ## About Meanshift
+> The metric we'll be computing is called Meanshift, and measures the probability that a data sample comes from a different distribution as some reference dataset. 
+> A meanshift value less than 0.05 indicates a stastically significant difference in the two distributions, i.e., data drift! TrustyAI will export one meanshift metric per column in your model data- so one metric per feature column, and one metric per output column, and they indicate the probability that the data in the column has diverged from your reference dataset.
 
 ## Collect "Real-World" Inferences
-1) Get the route to the model: 
+With the drift metric setup, the TrustyAI service will start producing drift metrics as soon as inference data begins arriving. To simulate receiving 
+"real-world" inference data, we'll set up a script to send a handful of inference payloads every second, and leave that running for a few minutes:
+2) Get the route to the model: 
 ```shell
-MODEL=gaussian-credit-model
-BASE_ROUTE=$(oc get inferenceservice gaussian-credit-model -o jsonpath='{.status.url}')
-MODEL_ROUTE="${BASE_ROUTE}/v2/models/${MODEL}/infer"
-```
-2) Send data payloads to model:
-```shell
+MODEL_ROUTE=$(oc get inferenceservice gaussian-credit-model -o jsonpath='{.status.url}')/v2/models/gaussian-credit-model/infer
 for batch in {0..595..5}; do
   curl -sk \
   -H "Authorization: Bearer ${TOKEN}" \
@@ -197,9 +181,15 @@ done
 ```
 
 ## Observe Drift
-![Post-deployment metrics](images/meanshift_post.png).
+While that script is running, let's go watch the drift metrics in real time!
 
-Navigating back to the Observe -> Metrics page in the OpenShift console, we can see the MeanShift metric
+1) Navigate to Observe -> Metrics in the OpenShift console. If you're already on that page, you may need to refresh before the new metrics appear in the suggested expressions.
+2) Set the time window to 5 minutes (top left) and the refresh interval to 15 seconds (top right)
+3) In the "Expression" field, enter `trustyai_meanshift`. It might take a few seconds before the cluster monitoring stacks picks up the new metric, so if `trustyai_meanshift` is not appearing, try refreshing the page.
+4) Explore the Metric Chart:
+![Post-deployment metrics](images/meanshift_post.png)
+
+We can see the MeanShift metric
 values for the various features changes. Notably, the values for `Credit Score`, `Age`, and `Acceptance Probability` have all dropped to 0, indicating there is a statistically very high likelihood that the values of these fields in the inference data come from a different distribution than that of the training data. Meanwhile, the `Years of Employment` and `Years of Education` scores have dropped to 0.34 and 0.82 respectively, indicating that there is a little drift, but not enough to be particularly concerning. Remember, the Mean-Shift metric scores are p-values, so only values < 0.05 indicate statistical significance. 
 
 ## A Peek Behind The Curtain
@@ -220,3 +210,14 @@ it does not matter if your models are impeccable over the training data: it is o
 deployed to real users that these models provide any meaningful value, and it is only during
 this deployment that their performance actually _matters_, where these models might begin to affect your user's lives and livelihoods. Using TrustyAI to monitor the data drift can help you trust that your
 models are operating in familiar territory and that they can accurately apply all the intuitions they learned during training. 
+
+## Cleanup
+To clean up this demo, run:
+```shell
+oc delete -f resources/model_gaussian_credit.yaml
+oc delete -f resources/model_storage_container.yaml
+TRUSTY_POD=$(oc get pods -o name | grep trustyai)
+oc exec $TRUSTY_POD -- bash -c "rm -f /inputs/*.csv /inputs/*.json"
+oc delete $TRUSTY_POD
+```
+This will uninstall your model, delete all recorded model data from the TrustyAI service, and delete any metric computations you may have set up.
